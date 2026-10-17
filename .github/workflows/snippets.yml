@@ -173,6 +173,36 @@ jobs:
       - name: Validate Stellar testnet snippets
         run: pnpm run check:stellar-testnet
 
+  broken-links:
+    name: Broken-link check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Internal-only check runs on every PR (fast, no network).
+      # External check runs additionally on pushes to develop / main.
+      - name: Check internal links (routes, anchors, assets)
+        run: pnpm run check:broken-links:internal
+
+      - name: Check external links
+        if: github.event_name == 'push'
+        run: pnpm run check:broken-links
+
   playground-smoke:
     name: Playground smoke test
     runs-on: ubuntu-latest
