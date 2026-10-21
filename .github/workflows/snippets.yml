@@ -69,6 +69,9 @@ jobs:
       - name: Check snippets
         run: pnpm run check:snippets
 
+      - name: Check integration guides
+        run: pnpm run check:integration-guides
+
       - name: Check placeholders
         run: pnpm run check:placeholders
 
@@ -246,3 +249,50 @@ jobs:
 
       - name: Run playground smoke tests
         run: pnpm run test:playground
+
+  check-stellar-reference:
+    name: Stellar contract reference check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Stellar CLI
+        # Pinned to the same minor used during the last registry verification.
+        # Update this pin when the CLI interface changes in a way that affects
+        # `stellar contract inspect` output parsing.
+        run: |
+          curl -sSfL https://github.com/stellar/stellar-cli/releases/download/v28.1.0/stellar-cli-28.1.0-x86_64-unknown-linux-gnu.tar.gz \
+            | tar -xz -C /usr/local/bin stellar
+          stellar version
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Only the two contracts that currently have live testnet addresses are
+      # listed here (from scripts/contract-registry.json, stellar-testnet block).
+      # stealth-registry and stealth-sender are not yet deployed and are omitted
+      # until their addresses appear in the registry.
+      - name: Check Stellar generated reference
+        env:
+          STELLAR_CONTRACT_IDS: >-
+            {
+              "stealth-announcer": "CCJLJ2QRBJAAKIG6ELNQVXLLWMKKWVN5O2FKWUETHZGMPAD4MHK7WVWL",
+              "wraith-names": "CDEMB3MAE62ZOCCKZPTYSXR5CS5WVENPOU5MDVK4PNKTZXFVDC74AFBV"
+            }
+          STELLAR_NETWORK: testnet
+        run: >-
+          pnpm exec tsx scripts/generate-stellar-reference.ts
+          --check
+          --require-contracts=stealth-announcer,wraith-names

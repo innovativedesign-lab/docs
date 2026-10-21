@@ -1,0 +1,209 @@
+---
+title: "Solid Integration"
+description: "Receive and scan stealth payments in Solid and SolidStart with @wraith-protocol/sdk"
+---
+
+The Wraith SDK is framework-agnostic. This guide wraps it in Solid signals to poll for incoming stealth payments, with proper teardown, request cancellation, and SolidStart SSR handling.
+
+The flow is the same everywhere: connect a `WraithAgent`, call `scanPayments()` on an interval, and render the returned `Payment[]`. Getting the lifecycle right matters, because a leaked interval keeps scanning after a component unmounts, and a stale scan can overwrite fresher results.
+
+## Installation
+
+```bash
+npm install @wraith-protocol/sdk
+```
+
+## 1. Create the receiver
+
+Put the framework-agnostic logic in a plain module so it is easy to unit test. `scan()` aborts any request that is still in flight before starting a new one, and `stop()` clears the interval and aborts the active request.
+
+```ts
+import { Wraith, type Payment, type WraithAgent } from "@wraith-protocol/sdk";
+
+export function createWraithClient(apiKey: string): Wraith {
+  return new Wraith({ apiKey });
+}
+
+export function connectAgent(client: Wraith, wallet: string): Promise<WraithAgent> {
+  return client.getAgentByWallet(wallet);
+}
+
+export interface ReceiveOptions {
+  intervalMs?: number;
+  onPayments: (payments: Payment[]) => void;
+  onError?: (error: Error) => void;
+}
+
+export class PaymentReceiver {
+  private readonly agent: WraithAgent;
+  private readonly options: ReceiveOptions;
+  private controller: AbortController | null = null;
+  private timer: ReturnType<typeof setInterval> | null = null;
+
+  constructor(agent: WraithAgent, options: ReceiveOptions) {
+    this.agent = agent;
+    this.options = options;
+  }
+
+  async scan(): Promise<Payment[]> {
+    this.controller?.abort();
+    const controller = new AbortController();
+    this.controller = controller;
+
+    try {
+      const payments = await this.agent.scanPayments();
+      if (controller.signal.aborted) return [];
+      this.options.onPayments(payments);
+      return payments;
+    } catch (error) {
+      if (controller.signal.aborted) return [];
+      this.options.onError?.(error as Error);
+      return [];
+    } finally {
+      if (this.controller === controller) this.controller = null;
+    }
+  }
+
+  start(intervalMs = this.options.intervalMs ?? 30_000): void {
+    this.stop();
+    void this.scan();
+    this.timer = setInterval(() => void this.scan(), intervalMs);
+  }
+
+  stop(): void {
+    if (this.timer !== null) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    this.controller?.abort();
+    this.controller = null;
+  }
+}
+```
+
+`scanPayments()` is not cancellable at the network layer, so the receiver uses an `AbortController` as a guard: when a scan is superseded or the component unmounts, its result is discarded instead of being applied. This is what stops a slow request from clobbering newer state.
+
+## 2. Wrap it in a signal
+
+`onMount` runs only in the browser, so the receiver is never started during SSR. `onCleanup` runs when the owning scope is disposed, which stops the receiver and aborts any in-flight scan. Returning `stop` means the same code runs whether the component unmounts normally or Solid tears the scope down early.
+
+```ts no-check
+import { createSignal, onCleanup, onMount, type Accessor } from "solid-js";
+import { createWraithClient, PaymentReceiver } from "./wraith";
+import type { Payment } from "@wraith-protocol/sdk";
+
+export function createPaymentReceiver(
+  apiKey: string,
+  agentId: string,
+): {
+  payments: Accessor<Payment[]>;
+  error: Accessor<string | null>;
+  scanning: Accessor<boolean>;
+  refresh: () => Promise<void>;
+} {
+  const [payments, setPayments] = createSignal<Payment[]>([]);
+  const [error, setError] = createSignal<string | null>(null);
+  const [scanning, setScanning] = createSignal(false);
+  let receiver: PaymentReceiver | null = null;
+
+  onMount(() => {
+    const agent = createWraithClient(apiKey).agent(agentId);
+    receiver = new PaymentReceiver(agent, {
+      intervalMs: 30_000,
+      onPayments: (incoming) => {
+        setPayments(incoming);
+        setError(null);
+      },
+      onError: (err) => setError(err.message),
+    });
+    receiver.start();
+  });
+
+  onCleanup(() => {
+    receiver?.stop();
+    receiver = null;
+  });
+
+  const refresh = async () => {
+    if (!receiver) return;
+    setScanning(true);
+    try {
+      await receiver.scan();
+    } finally {
+      setScanning(false);
+    }
+  };
+
+  return { payments, error, scanning, refresh };
+}
+```
+
+## 3. Render the signal in a component
+
+```tsx no-check
+import { For, Show } from "solid-js";
+import { createPaymentReceiver } from "./wraith-receiver";
+
+export function PaymentList(props: { apiKey: string; agentId: string }) {
+  const { payments, error, scanning, refresh } =
+    createPaymentReceiver(props.apiKey, props.agentId);
+
+  return (
+    <section>
+      <button disabled={scanning()} onClick={refresh}>
+        {scanning() ? "Scanning…" : `Scan now (${payments().length})`}
+      </button>
+
+      <Show when={error()}>
+        {(message) => <p class="error">{message()}</p>}
+      </Show>
+
+      <ul>
+        <For each={payments()}>
+          {(payment) => (
+            <li>
+              <code>{payment.stealthAddress}</code> — {payment.balance}
+            </li>
+          )}
+        </For>
+      </ul>
+    </section>
+  );
+}
+```
+
+## SSR and hydration
+
+SolidStart renders components on the server. Two rules keep the composable safe:
+
+- **Never touch the client during setup.** Instantiate the `Wraith` client inside `onMount`, which Solid does not call on the server. If you create a client outside a component, guard it with `isServer` from `solid-js`.
+- **Start from a deterministic initial state.** `payments` starts as an empty array, so server markup and the first client render match and Solid does not warn about a hydration mismatch.
+
+```ts no-check
+import { isServer } from "solid-js";
+import { createWraithClient } from "./wraith";
+
+export const wraith = isServer
+  ? null
+  : createWraithClient(import.meta.env.VITE_WRAITH_API_KEY);
+```
+
+## Full example
+
+The composable and component above are the complete flow. Use one receiver per agent, then read `payments()` wherever the data is needed.
+
+## Receive a payment
+
+To fund the agent so it has something to scan, send a stealth payment to its meta-address. The agent's address for a chain is on `agent.info`.
+
+```ts
+import { Chain, Wraith } from "@wraith-protocol/sdk";
+
+export async function showMetaAddress(apiKey: string): Promise<string> {
+  const wraith = new Wraith({ apiKey });
+  const agent = await wraith.getAgentByName("alice");
+  return agent.info.metaAddresses[Chain.Horizen];
+}
+```
+
+Anyone can now send to that meta-address, and the receiver in your Solid component picks it up on the next scan.

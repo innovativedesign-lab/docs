@@ -6,5 +6,8 @@
   "phoenix": "Phoenix DEX",
   "react-native": "React Native",
   "reflector": "Reflector Oracle",
-  "soroswap": "Soroswap"
+  "solid": "Solid",
+  "soroswap": "Soroswap",
+  "svelte": "Svelte",
+  "vue": "Vue"
 }

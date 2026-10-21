@@ -1,41 +1,98 @@
-const previewUrl = process.env.MINTLIFY_PREVIEW_URL;
+#!/usr/bin/env node
+/**
+ * check-preview-redirect.mjs
+ *
+ * Verifies that the Mintlify PR-preview environment redirects the legacy
+ * /README path to /introduction, exercising the single redirect entry in
+ * docs.json.
+ *
+ * Usage (CLI):
+ *   MINTLIFY_PREVIEW_URL=https://… node scripts/check-preview-redirect.mjs
+ *
+ * The core validation is exported as `validatePreviewRedirect` so that
+ * scripts/check-preview-redirect.test.mjs can exercise it against a local
+ * mock server without requiring a live Mintlify deployment.
+ */
 
-if (!previewUrl) {
-  console.error("Set MINTLIFY_PREVIEW_URL to the base URL of the Mintlify PR preview.");
-  process.exit(1);
+/**
+ * Validates a single redirect response.
+ *
+ * @param {string}   requestUrl   - The URL that was fetched (for error messages).
+ * @param {number}   status       - HTTP status code returned by the server.
+ * @param {string|null} location  - Value of the Location response header.
+ * @param {string}   expectedPath - The pathname the redirect must point at.
+ * @returns {{ ok: boolean; message: string }}
+ */
+export function validatePreviewRedirect(requestUrl, status, location, expectedPath) {
+  if (status < 300 || status >= 400) {
+    return {
+      ok: false,
+      message: `Expected ${requestUrl} to return a 3xx redirect; received ${status}.`,
+    };
+  }
+
+  if (!location) {
+    return {
+      ok: false,
+      message: `Expected ${requestUrl} to include a Location header; received none.`,
+    };
+  }
+
+  const destination = new URL(location, requestUrl);
+  if (destination.pathname !== expectedPath) {
+    return {
+      ok: false,
+      message: `Expected ${requestUrl} to resolve to ${expectedPath}; Location was ${location}.`,
+    };
+  }
+
+  return {
+    ok: true,
+    message: `Verified ${requestUrl} returns ${status} redirect to ${destination.pathname}.`,
+  };
 }
 
-let baseUrl;
-try {
-  baseUrl = new URL(previewUrl);
-} catch {
-  console.error(`MINTLIFY_PREVIEW_URL is not a valid URL: ${previewUrl}`);
-  process.exit(1);
+// ---------------------------------------------------------------------------
+// CLI entry-point – only runs when the script is executed directly.
+// ---------------------------------------------------------------------------
+const isMain =
+  typeof process !== "undefined" &&
+  process.argv[1] &&
+  (await import("node:url")).fileURLToPath(import.meta.url) === process.argv[1];
+
+if (isMain) {
+  const previewUrl = process.env.MINTLIFY_PREVIEW_URL;
+
+  if (!previewUrl) {
+    console.error(
+      "Set MINTLIFY_PREVIEW_URL to the base URL of the Mintlify PR preview.",
+    );
+    process.exit(1);
+  }
+
+  let baseUrl;
+  try {
+    baseUrl = new URL(previewUrl);
+  } catch {
+    console.error(`MINTLIFY_PREVIEW_URL is not a valid URL: ${previewUrl}`);
+    process.exit(1);
+  }
+
+  if (!/^https?:$/.test(baseUrl.protocol)) {
+    console.error("MINTLIFY_PREVIEW_URL must use HTTP or HTTPS.");
+    process.exit(1);
+  }
+
+  const requestUrl = new URL("/README", baseUrl).toString();
+  const response = await fetch(requestUrl, { redirect: "manual" });
+  const location = response.headers.get("location");
+
+  const result = validatePreviewRedirect(requestUrl, response.status, location, "/introduction");
+
+  if (!result.ok) {
+    console.error(result.message);
+    process.exit(1);
+  }
+
+  console.log(result.message);
 }
-
-if (!/^https?:$/.test(baseUrl.protocol)) {
-  console.error("MINTLIFY_PREVIEW_URL must use HTTP or HTTPS.");
-  process.exit(1);
-}
-
-const requestUrl = new URL("/README", baseUrl);
-const response = await fetch(requestUrl, { redirect: "manual" });
-
-if (response.status < 300 || response.status >= 400) {
-  console.error(`Expected ${requestUrl} to return a 3xx redirect; received ${response.status}.`);
-  process.exit(1);
-}
-
-const location = response.headers.get("location");
-if (!location) {
-  console.error(`Expected ${requestUrl} to include a Location header; received none.`);
-  process.exit(1);
-}
-
-const destination = new URL(location, requestUrl);
-if (destination.pathname !== "/introduction") {
-  console.error(`Expected ${requestUrl} to resolve to /introduction; Location was ${location}.`);
-  process.exit(1);
-}
-
-console.log(`Verified ${requestUrl} returns ${response.status} redirect to ${destination.pathname}.`);

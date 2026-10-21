@@ -162,7 +162,10 @@
               "guides/integrations/phoenix",
               "guides/integrations/react-native",
               "guides/integrations/reflector",
-              "guides/integrations/soroswap"
+              "guides/integrations/solid",
+              "guides/integrations/soroswap",
+              "guides/integrations/svelte",
+              "guides/integrations/vue"
             ]
           },
           {

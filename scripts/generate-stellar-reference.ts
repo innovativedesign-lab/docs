@@ -37,10 +37,35 @@ const contractTitles: Record<string, string> = {
 
 const args = new Set(process.argv.slice(2));
 const checkMode = args.has("--check");
-const allowMissing = args.has("--allow-missing");
+// --allow-missing is no longer accepted; the flag is rejected so stale CI
+// invocations surface immediately rather than silently passing.
+if (args.has("--allow-missing")) {
+  throw new Error(
+    "--allow-missing has been removed. Supply STELLAR_CONTRACT_IDS or STELLAR_BINDINGS_DIR so the check has real data.",
+  );
+}
+
+// --require-contracts=slug1,slug2 asserts that every listed slug appears in
+// the generated reference. Use this in CI to catch gaps when a new contract
+// is deployed but the docs section was never generated.
+const requireContractsFlag = [...args].find((a) => a.startsWith("--require-contracts="));
+const requiredContracts: string[] =
+  requireContractsFlag ? requireContractsFlag.slice("--require-contracts=".length).split(",").filter(Boolean) : [];
 
 function main() {
   const references = loadReferencesOrExit();
+
+  if (requiredContracts.length > 0) {
+    const generatedSlugs = new Set(references.map((r) => r.slug));
+    const missing = requiredContracts.filter((slug) => !generatedSlugs.has(slug));
+    if (missing.length > 0) {
+      throw new Error(
+        `Required contract(s) missing from generated reference: ${missing.join(", ")}.\n` +
+          "Add the contract to STELLAR_CONTRACT_IDS or STELLAR_BINDINGS_DIR and re-run.",
+      );
+    }
+  }
+
   const generated = renderReference(references);
   const current = readFileSync(stellarDocPath, "utf8");
   const updated = replaceBetweenMarkers(current, generated);
@@ -61,11 +86,6 @@ function loadReferencesOrExit(): ContractReference[] {
   try {
     return loadReferences();
   } catch (error) {
-    if (checkMode && allowMissing) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.warn(`Skipping Stellar reference check: ${message}`);
-      process.exit(0);
-    }
     throw error;
   }
 }
@@ -304,18 +324,21 @@ function loadFromStellarInspect(): ContractReference[] {
 
   return Object.entries(configured).map(([slug, entry]) => {
     const contractId = typeof entry === "string" ? entry : entry[network] ?? entry.testnet ?? Object.values(entry)[0];
-    const output = execFileSync(cli, ["contract", "inspect", "--id", contractId, "--network", network], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    // `stellar contract info interface` replaced the old `contract inspect --id`
+    // in CLI v28+. stdout is clean Rust trait output; info lines go to stderr.
+    const output = execFileSync(
+      cli,
+      ["contract", "info", "interface", "--contract-id", contractId, "--network", network, "--output", "rust"],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    );
 
     return {
       slug,
       title: contractTitles[slug] ?? slug,
       addresses: { [network]: contractId },
-      functions: parseInspectFunctions(output),
-      events: parseInspectList(output, "Events"),
-      storageKeys: parseInspectList(output, "Storage"),
+      functions: parseInfoFunctions(output),
+      events: parseInfoEvents(output),
+      storageKeys: parseInfoStorageKeys(output),
     };
   });
 }
@@ -337,6 +360,92 @@ function readJsonFile<T>(filePath: string): T {
   return JSON.parse(readFileSync(filePath, "utf8").replace(/^\uFEFF/, "")) as T;
 }
 
+// ---------------------------------------------------------------------------
+// Parsers for `stellar contract info interface --output rust`
+//
+// The output is a Rust snippet with a `pub trait Contract { fn ... }` block
+// followed by contracttype/contracterror enum and struct definitions.
+// ---------------------------------------------------------------------------
+
+function parseInfoFunctions(output: string): FunctionReference[] {
+  // Extract the trait body between `pub trait Contract {` and the closing `}`.
+  const traitMatch = output.match(/pub\s+trait\s+Contract\s*\{([\s\S]*?)\n\}/);
+  if (!traitMatch) return [];
+
+  const functions: FunctionReference[] = [];
+  // Each function: `fn name(\n    env: ...,\n    param: Type,\n) -> ReturnType;`
+  // The fn body may span multiple lines; params are separated by `,\n`.
+  const fnPattern = /\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([\s\S]*?)\)\s*(?:->\s*([^;{]+))?;/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = fnPattern.exec(traitMatch[1]))) {
+    const name = match[1];
+    const rawParams = match[2]
+      .split(",")
+      .map((p) => p.trim())
+      .filter(Boolean)
+      .filter((p) => !p.startsWith("env:") && p !== "env: soroban_sdk::Env");
+
+    const params = rawParams.map((p) => {
+      const colonIdx = p.indexOf(":");
+      if (colonIdx === -1) return { name: p, type: "unknown" };
+      return {
+        name: p.slice(0, colonIdx).trim(),
+        type: normalizeType(p.slice(colonIdx + 1).trim()),
+      };
+    });
+
+    const rawReturn = match[3]?.trim() ?? "void";
+    // Strip Result<T, E> wrapper — docs show the success type only.
+    const returnType = normalizeType(rawReturn.replace(/^Result<([^,>]+),\s*[^>]+>$/, "$1"));
+
+    functions.push({ name, params, returnType, authRequired: inferAuth(name, params) });
+  }
+
+  return functions.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function parseInfoEvents(output: string): string[] {
+  // `stellar contract info interface` emits `#[soroban_sdk::contractevent]`
+  // annotated enums for contract events. Extract their variants.
+  const events = new Set<string>();
+  const eventEnumPattern =
+    /#\[soroban_sdk::contractevent\][\s\S]*?pub\s+enum\s+[A-Za-z0-9_]+\s*\{([\s\S]*?)\n\}/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = eventEnumPattern.exec(output))) {
+    match[1]
+      .split("\n")
+      .map((line) => line.trim().replace(/,$/, ""))
+      .filter((line) => line && !line.startsWith("//") && !line.startsWith("#"))
+      .forEach((variant) => events.add(toSnakeCase(variant.replace(/\s*\{[\s\S]*?\}/, "").trim())));
+  }
+
+  return [...events].sort();
+}
+
+function parseInfoStorageKeys(output: string): string[] {
+  // Storage key enums are tagged `#[soroban_sdk::contracttype]` and named
+  // DataKey or StorageKey by convention.
+  const keys = new Set<string>();
+  const keyEnumPattern =
+    /#\[soroban_sdk::contracttype\][\s\S]*?pub\s+enum\s+(?:[A-Za-z0-9_]*(?:DataKey|StorageKey)[A-Za-z0-9_]*)\s*\{([\s\S]*?)\n\}/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = keyEnumPattern.exec(output))) {
+    match[1]
+      .split("\n")
+      .map((line) => line.trim().replace(/,$/, "").replace(/\(.*\)$/, ""))
+      .filter((line) => line && !line.startsWith("//") && !line.startsWith("#"))
+      .forEach((variant) => keys.add(variant));
+  }
+
+  return [...keys].sort();
+}
+
+// Keep the old inspect parsers for any caller that may still reference them
+// (e.g. tests); they are no longer used by loadFromStellarInspect.
+/** @deprecated Use parseInfoFunctions instead. */
 function parseInspectFunctions(output: string): FunctionReference[] {
   const functions: FunctionReference[] = [];
   const fnPattern = /(?:^|\n)\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)\s*(?:->\s*([^\n]+))?/g;
@@ -364,6 +473,7 @@ function parseInspectFunctions(output: string): FunctionReference[] {
   return functions;
 }
 
+/** @deprecated Use parseInfoStorageKeys / parseInfoEvents instead. */
 function parseInspectList(output: string, heading: string): string[] {
   const match = output.match(new RegExp(`${heading}:?\\s*\\n([\\s\\S]*?)(?:\\n\\S|$)`, "i"));
   if (!match) return [];
@@ -378,7 +488,7 @@ function renderReference(references: ContractReference[]): string {
   return [
     startMarker,
     "",
-    "<!-- This section is generated by scripts/generate-stellar-reference.ts. Do not edit by hand. -->",
+    "{/* This section is generated by scripts/generate-stellar-reference.ts. Do not edit by hand. */}",
     "",
     "## Generated contract reference",
     "",

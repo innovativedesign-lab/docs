@@ -1,0 +1,24 @@
+overrides:
+  # Lift axios past the SSRF advisory before @stellar/stellar-sdk ships a fix.
+  "axios@<1.20.0": ">=1.20.0"
+  # Lift follow-redirects past the two high credential-stripping CVEs
+  # (GHSA-q3jh-wrc6-jgq8, GHSA-8r9p-f939-6h3c) via @stellar/stellar-sdk > axios.
+  "follow-redirects@<1.16.1": ">=1.16.1"
+  # Lift toml past the uncontrolled recursion and prototype pollution highs
+  # (GHSA-82x6-q7mm-w9cf, GHSA-v5mp-jgw5-2x6j) via @stellar/stellar-sdk.
+  "toml@<4.2.0": "^4.2.0"
+  # Lift uuid past the insecure randomness advisory via @solana/web3.js.
+  "uuid@<11.1.1": "^11.1.1"
+
+auditConfig:
+  ignoreGhsas:
+    # stream-json via @solana/web3.js > jayson — patched releases are ESM-only
+    # and break jayson's require() of subpaths it doesn't use. See DEPENDENCY-POLICY.md.
+    - GHSA-528h-pc64-c93x
+    - GHSA-hqr4-qq8f-hg3x
+    - GHSA-mjw6-4jj6-33hc
+
+allowBuilds:
+  bufferutil: true
+  esbuild: true
+  utf-8-validate: true

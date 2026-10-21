@@ -3,8 +3,6 @@ title: Stellar Block Explorer Integration
 description: How to link from your UI to a Stellar block explorer, with URL patterns, a TypeScript helper, and UX guidance.
 ---
 
-import { Callout } from "@/components/callout";
-
 # Stellar Block Explorer Integration
 
 Integrators frequently want to link from their UI to a Stellar block explorer. The patterns are non-obvious — testnet vs public URL bases, account vs transaction vs contract deep links all differ.
@@ -110,12 +108,12 @@ The `stellarExplorerUrl` helper above is written for stellar.expert; adjust the 
 
 ## Stellar Stealth Addresses and Privacy
 
-<Callout type="info">
+<Note>
   **Explorer transparency ≠ privacy break.**
   Stellar does not have stealth addresses in the cryptographic sense. All
   account addresses and transactions are publicly visible on-chain. Linking
   to an explorer does not reveal any information that isn't already public —
   it simply provides a convenient view of that public data.
-</Callout>
+</Note>
 
 If your application handles sensitive workflows, consider whether surfacing an explorer link is appropriate UX for your users, but know that the link itself does not create a privacy leak beyond what the ledger already exposes.

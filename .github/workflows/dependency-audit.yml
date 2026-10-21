@@ -1,0 +1,44 @@
+name: Dependency audit
+
+# Executable docs tooling (snippet compiler, playground, quickstart harnesses)
+# pulls in the chain SDKs as production dependencies. This job enforces the
+# policy in DEPENDENCY-POLICY.md: no high or critical advisories on any
+# production dependency path. Moderate findings may be recorded in
+# `pnpm.auditConfig.ignoreGhsas` in package.json with a documented reason.
+#
+# The weekly run re-checks against the live advisory database so a newly
+# disclosed advisory fails the build even without a dependency change.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - develop
+      - main
+  schedule:
+    - cron: "0 6 * * 1"
+
+jobs:
+  audit:
+    name: Production dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Fail on high or critical advisories
+        run: pnpm audit --prod --audit-level high

@@ -1,0 +1,239 @@
+---
+title: "Svelte Integration"
+description: "Receive and scan stealth payments in Svelte and SvelteKit with @wraith-protocol/sdk"
+---
+
+The Wraith SDK is framework-agnostic. This guide wraps it in Svelte 5 runes to poll for incoming stealth payments, with proper teardown, request cancellation, and SvelteKit SSR handling.
+
+The flow is the same everywhere: connect a `WraithAgent`, call `scanPayments()` on an interval, and render the returned `Payment[]`. Getting the lifecycle right matters, because a leaked interval keeps scanning after a component unmounts, and a stale scan can overwrite fresher results.
+
+## Installation
+
+```bash
+npm install @wraith-protocol/sdk
+```
+
+## 1. Create the receiver
+
+Put the framework-agnostic logic in a plain module so it is easy to unit test. `scan()` aborts any request that is still in flight before starting a new one, and `stop()` clears the interval and aborts the active request.
+
+```ts
+import { Wraith, type Payment, type WraithAgent } from "@wraith-protocol/sdk";
+
+export function createWraithClient(apiKey: string): Wraith {
+  return new Wraith({ apiKey });
+}
+
+export function connectAgent(client: Wraith, wallet: string): Promise<WraithAgent> {
+  return client.getAgentByWallet(wallet);
+}
+
+export interface ReceiveOptions {
+  intervalMs?: number;
+  onPayments: (payments: Payment[]) => void;
+  onError?: (error: Error) => void;
+}
+
+export class PaymentReceiver {
+  private readonly agent: WraithAgent;
+  private readonly options: ReceiveOptions;
+  private controller: AbortController | null = null;
+  private timer: ReturnType<typeof setInterval> | null = null;
+
+  constructor(agent: WraithAgent, options: ReceiveOptions) {
+    this.agent = agent;
+    this.options = options;
+  }
+
+  async scan(): Promise<Payment[]> {
+    this.controller?.abort();
+    const controller = new AbortController();
+    this.controller = controller;
+
+    try {
+      const payments = await this.agent.scanPayments();
+      if (controller.signal.aborted) return [];
+      this.options.onPayments(payments);
+      return payments;
+    } catch (error) {
+      if (controller.signal.aborted) return [];
+      this.options.onError?.(error as Error);
+      return [];
+    } finally {
+      if (this.controller === controller) this.controller = null;
+    }
+  }
+
+  start(intervalMs = this.options.intervalMs ?? 30_000): void {
+    this.stop();
+    void this.scan();
+    this.timer = setInterval(() => void this.scan(), intervalMs);
+  }
+
+  stop(): void {
+    if (this.timer !== null) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    this.controller?.abort();
+    this.controller = null;
+  }
+}
+```
+
+`scanPayments()` is not cancellable at the network layer, so the receiver uses an `AbortController` as a guard: when a scan is superseded or the component unmounts, its result is discarded instead of being applied. This is what stops a slow request from clobbering newer state.
+
+## 2. Wrap it in a rune
+
+Runes only work inside `.svelte` files. An `$effect` can return a teardown function, which Svelte calls on unmount and before re-running the effect. Stopping the receiver there covers both cases.
+
+```svelte
+<script lang="ts">
+  import { browser } from "$app/environment";
+  import { createWraithClient, PaymentReceiver } from "$lib/wraith";
+  import type { Payment } from "@wraith-protocol/sdk";
+
+  let { apiKey, agentId }: { apiKey: string; agentId: string } = $props();
+
+  let payments = $state<Payment[]>([]);
+  let error = $state<string | null>(null);
+  let receiver: PaymentReceiver | null = null;
+
+  $effect(() => {
+    if (!browser) return;
+
+    const agent = createWraithClient(apiKey).agent(agentId);
+    receiver = new PaymentReceiver(agent, {
+      onPayments: (incoming) => {
+        payments = incoming;
+        error = null;
+      },
+      onError: (err) => {
+        error = err.message;
+      },
+    });
+
+    receiver.start();
+
+    return () => {
+      receiver?.stop();
+      receiver = null;
+    };
+  });
+</script>
+```
+
+## 3. Manual refresh
+
+Trigger an on-demand scan with the same receiver. Because `scan()` aborts the previous request, hammering the button cannot stack duplicate scans.
+
+```svelte
+<script lang="ts">
+  let scanning = $state(false);
+
+  async function refresh() {
+    if (!receiver) return;
+    scanning = true;
+    try {
+      await receiver.scan();
+    } finally {
+      scanning = false;
+    }
+  }
+</script>
+```
+
+## SSR and hydration
+
+SvelteKit renders components on the server by default. Two rules keep the receiver safe:
+
+- **Instantiate the client in the browser only.** Guard the effect with `if (!browser) return;` from `$app/environment`. `$effect` already skips the server, but the guard documents the intent and protects any code you move into component setup.
+- **Start from a deterministic initial state.** Initialise `payments` to `[]` and only fill it after mount. Server-rendered markup and the first client render must match, or Svelte warns about a hydration mismatch.
+
+For a plain Vite + Svelte app (no SSR), the `browser` guard is unnecessary, but the `$effect` teardown is still required.
+
+## Full example
+
+```svelte
+<script lang="ts">
+  import { browser } from "$app/environment";
+  import { createWraithClient, PaymentReceiver } from "$lib/wraith";
+  import type { Payment } from "@wraith-protocol/sdk";
+
+  let { apiKey, agentId }: { apiKey: string; agentId: string } = $props();
+
+  let payments = $state<Payment[]>([]);
+  let error = $state<string | null>(null);
+  let scanning = $state(false);
+  let receiver: PaymentReceiver | null = null;
+
+  $effect(() => {
+    if (!browser) return;
+
+    const agent = createWraithClient(apiKey).agent(agentId);
+    receiver = new PaymentReceiver(agent, {
+      intervalMs: 30_000,
+      onPayments: (incoming) => {
+        payments = incoming;
+        error = null;
+      },
+      onError: (err) => {
+        error = err.message;
+      },
+    });
+
+    receiver.start();
+
+    return () => {
+      receiver?.stop();
+      receiver = null;
+    };
+  });
+
+  async function refresh() {
+    if (!receiver) return;
+    scanning = true;
+    try {
+      await receiver.scan();
+    } finally {
+      scanning = false;
+    }
+  }
+
+  const total = $derived(payments.length);
+</script>
+
+<section>
+  <button onclick={refresh} disabled={scanning}>
+    {scanning ? "Scanning…" : `Scan now (${total})`}
+  </button>
+
+  {#if error}
+    <p class="error">{error}</p>
+  {/if}
+
+  <ul>
+    {#each payments as payment (payment.stealthAddress)}
+      <li>
+        <code>{payment.stealthAddress}</code> — {payment.balance}
+      </li>
+    {/each}
+  </ul>
+</section>
+```
+
+## Receive a payment
+
+To fund the agent so it has something to scan, send a stealth payment to its meta-address. The agent's address for a chain is on `agent.info`.
+
+```ts
+import { Chain, Wraith } from "@wraith-protocol/sdk";
+
+export async function showMetaAddress(apiKey: string): Promise<string> {
+  const wraith = new Wraith({ apiKey });
+  const agent = await wraith.getAgentByName("alice");
+  return agent.info.metaAddresses[Chain.Horizen];
+}
+```
+
+Anyone can now send to that meta-address, and the receiver in your Svelte component picks it up on the next scan.

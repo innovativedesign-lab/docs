@@ -1,0 +1,198 @@
+---
+title: "Vue Integration"
+description: "Receive and scan stealth payments in Vue 3 with @wraith-protocol/sdk"
+---
+
+The Wraith SDK is framework-agnostic. This guide wraps it in a Vue 3 composable to poll for incoming stealth payments, with proper teardown, request cancellation, and SSR handling for Nuxt and plain Vite.
+
+The flow is the same everywhere: connect a `WraithAgent`, call `scanPayments()` on an interval, and render the returned `Payment[]`. Getting the lifecycle right matters, because a leaked interval keeps scanning after a component unmounts, and a stale scan can overwrite fresher results.
+
+## Installation
+
+```bash
+npm install @wraith-protocol/sdk
+```
+
+## 1. Create the receiver
+
+Put the framework-agnostic logic in a plain module so it is easy to unit test. `scan()` aborts any request that is still in flight before starting a new one, and `stop()` clears the interval and aborts the active request.
+
+```ts
+import { Wraith, type Payment, type WraithAgent } from "@wraith-protocol/sdk";
+
+export function createWraithClient(apiKey: string): Wraith {
+  return new Wraith({ apiKey });
+}
+
+export function connectAgent(client: Wraith, wallet: string): Promise<WraithAgent> {
+  return client.getAgentByWallet(wallet);
+}
+
+export interface ReceiveOptions {
+  intervalMs?: number;
+  onPayments: (payments: Payment[]) => void;
+  onError?: (error: Error) => void;
+}
+
+export class PaymentReceiver {
+  private readonly agent: WraithAgent;
+  private readonly options: ReceiveOptions;
+  private controller: AbortController | null = null;
+  private timer: ReturnType<typeof setInterval> | null = null;
+
+  constructor(agent: WraithAgent, options: ReceiveOptions) {
+    this.agent = agent;
+    this.options = options;
+  }
+
+  async scan(): Promise<Payment[]> {
+    this.controller?.abort();
+    const controller = new AbortController();
+    this.controller = controller;
+
+    try {
+      const payments = await this.agent.scanPayments();
+      if (controller.signal.aborted) return [];
+      this.options.onPayments(payments);
+      return payments;
+    } catch (error) {
+      if (controller.signal.aborted) return [];
+      this.options.onError?.(error as Error);
+      return [];
+    } finally {
+      if (this.controller === controller) this.controller = null;
+    }
+  }
+
+  start(intervalMs = this.options.intervalMs ?? 30_000): void {
+    this.stop();
+    void this.scan();
+    this.timer = setInterval(() => void this.scan(), intervalMs);
+  }
+
+  stop(): void {
+    if (this.timer !== null) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+    this.controller?.abort();
+    this.controller = null;
+  }
+}
+```
+
+`scanPayments()` is not cancellable at the network layer, so the receiver uses an `AbortController` as a guard: when a scan is superseded or the component unmounts, its result is discarded instead of being applied. This is what stops a slow request from clobbering newer state.
+
+## 2. Wrap it in a composable
+
+`onMounted` runs only in the browser, so the receiver is never started during SSR. `onUnmounted` stops it, which aborts any in-flight scan and clears the polling interval.
+
+```ts no-check
+import { onMounted, onUnmounted, ref, shallowRef } from "vue";
+import { createWraithClient, PaymentReceiver } from "./wraith";
+import type { Payment } from "@wraith-protocol/sdk";
+
+export function usePaymentReceiver(apiKey: string, agentId: string) {
+  const payments = ref<Payment[]>([]);
+  const error = ref<string | null>(null);
+  const scanning = ref(false);
+  const receiver = shallowRef<PaymentReceiver | null>(null);
+
+  onMounted(() => {
+    const agent = createWraithClient(apiKey).agent(agentId);
+    const instance = new PaymentReceiver(agent, {
+      intervalMs: 30_000,
+      onPayments: (incoming) => {
+        payments.value = incoming;
+        error.value = null;
+      },
+      onError: (err) => {
+        error.value = err.message;
+      },
+    });
+
+    receiver.value = instance;
+    instance.start();
+  });
+
+  onUnmounted(() => {
+    receiver.value?.stop();
+    receiver.value = null;
+  });
+
+  async function refresh() {
+    if (!receiver.value) return;
+    scanning.value = true;
+    try {
+      await receiver.value.scan();
+    } finally {
+      scanning.value = false;
+    }
+  }
+
+  return { payments, error, scanning, refresh };
+}
+```
+
+## 3. Use it in a component
+
+```vue
+<script setup lang="ts">
+import { computed } from "vue";
+import { usePaymentReceiver } from "./usePaymentReceiver";
+
+const props = defineProps<{ apiKey: string; agentId: string }>();
+
+const { payments, error, scanning, refresh } = usePaymentReceiver(
+  props.apiKey,
+  props.agentId,
+);
+
+const total = computed(() => payments.value.length);
+</script>
+
+<template>
+  <section>
+    <button :disabled="scanning" @click="refresh">
+      {{ scanning ? "Scanning…" : `Scan now (${total})` }}
+    </button>
+
+    <p v-if="error" class="error">{{ error }}</p>
+
+    <ul>
+      <li v-for="payment in payments" :key="payment.stealthAddress">
+        <code>{{ payment.stealthAddress }}</code> — {{ payment.balance }}
+      </li>
+    </ul>
+  </section>
+</template>
+```
+
+## SSR and hydration
+
+Vue 3 and Nuxt render components on the server. Two rules keep the composable safe:
+
+- **Never touch the client during setup.** Instantiate the `Wraith` client inside `onMounted`, which Vue does not call on the server. If you also create a top-level client for other features, guard it with Nuxt's `import.meta.client` (or `import.meta.env.SSR` in plain Vite).
+- **Start from a deterministic initial state.** `payments` starts as an empty ref, so server markup and the first client render match and Vue does not warn about a hydration mismatch.
+
+```ts no-check
+const wraith = import.meta.client
+  ? createWraithClient(useRuntimeConfig().public.wraithApiKey)
+  : null;
+```
+
+## Receive a payment
+
+To fund the agent so it has something to scan, send a stealth payment to its meta-address. The agent's address for a chain is on `agent.info`.
+
+```ts
+import { Chain, Wraith } from "@wraith-protocol/sdk";
+
+export async function showMetaAddress(apiKey: string): Promise<string> {
+  const wraith = new Wraith({ apiKey });
+  const agent = await wraith.getAgentByName("alice");
+  return agent.info.metaAddresses[Chain.Horizen];
+}
+```
+
+Anyone can now send to that meta-address, and the composable picks it up on the next scan.

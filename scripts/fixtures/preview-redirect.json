@@ -1,0 +1,61 @@
+{
+  "$comment": "Fixtures for scripts/check-preview-redirect.test.mjs. Each case is served by a local HTTP server so the tests run without a live Mintlify preview deployment. 'expectedPath' is the pathname the redirect destination must equal for the check to pass.",
+  "cases": [
+    {
+      "description": "301 redirect to /introduction (canonical happy path)",
+      "status": 301,
+      "location": "/introduction",
+      "expectedPath": "/introduction",
+      "expectOk": true
+    },
+    {
+      "description": "302 redirect to /introduction (also accepted)",
+      "status": 302,
+      "location": "/introduction",
+      "expectedPath": "/introduction",
+      "expectOk": true
+    },
+    {
+      "description": "308 permanent redirect to /introduction (also accepted)",
+      "status": 308,
+      "location": "/introduction",
+      "expectedPath": "/introduction",
+      "expectOk": true
+    },
+    {
+      "description": "200 OK instead of a redirect",
+      "status": 200,
+      "location": null,
+      "expectedPath": "/introduction",
+      "expectOk": false
+    },
+    {
+      "description": "404 Not Found instead of a redirect",
+      "status": 404,
+      "location": null,
+      "expectedPath": "/introduction",
+      "expectOk": false
+    },
+    {
+      "description": "301 redirect but Location header is missing",
+      "status": 301,
+      "location": null,
+      "expectedPath": "/introduction",
+      "expectOk": false
+    },
+    {
+      "description": "301 redirect to wrong destination /getting-started",
+      "status": 301,
+      "location": "/getting-started",
+      "expectedPath": "/introduction",
+      "expectOk": false
+    },
+    {
+      "description": "301 redirect to wrong destination /README (no-op loop)",
+      "status": 301,
+      "location": "/README",
+      "expectedPath": "/introduction",
+      "expectOk": false
+    }
+  ]
+}
