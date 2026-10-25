@@ -81,6 +81,9 @@ jobs:
       - name: Check contract registry
         run: pnpm run check:contract-registry
 
+      - name: Check compatibility matrix
+        run: pnpm run check:compatibility-matrix
+
       - name: Check redirects and anchors
         env:
           DOCS_DIFF_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -89,6 +92,9 @@ jobs:
 
       - name: Test redirects and anchors check
         run: pnpm run test:redirects-and-anchors
+
+      - name: Test compatibility matrix (regression fixtures)
+        run: pnpm run test:compatibility-matrix
 
   check-snippets-extended:
     name: Compile Rust / Python / shell / config snippets
@@ -137,10 +143,20 @@ jobs:
       - name: Check extended snippets (Rust / Python / shell / JSON / TOML / YAML)
         run: pnpm run check:snippets-extended
 
+  # ---------------------------------------------------------------------------
+  # Stellar testnet snippet validation — split into two steps so that
+  # deterministic content regressions block merges while provider outages
+  # are surfaced as annotations without blocking.
+  #
+  # Exit codes from check-stellar-testnet-snippets.ts:
+  #   0  – passed
+  #   1  – content regression   → always a hard failure
+  #   2  – provider outage      → warning annotation, does NOT block merge
+  # ---------------------------------------------------------------------------
   stellar-testnet-snippets:
     name: Stellar snippet testnet validation
     runs-on: ubuntu-latest
-    continue-on-error: true
+    # No top-level continue-on-error — individual steps control leniency.
     needs: extract-sdk-version
     steps:
       - name: Checkout
@@ -173,7 +189,11 @@ jobs:
         run: |
           echo "Testing against SDK version: ${{ needs.extract-sdk-version.outputs.sdk-version }}"
 
-      - name: Validate Stellar testnet snippets
+      # BLOCKING: deterministic content checks only (snippet count, file
+      # existence). A failure here means a real doc regression. Exit 1.
+      - name: Validate Stellar snippet content (blocking)
+        env:
+          MODE: content
         run: pnpm run check:stellar-testnet
 
   broken-links:
